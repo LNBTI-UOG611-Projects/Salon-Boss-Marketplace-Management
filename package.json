@@ -1,0 +1,16 @@
+{
+  "name": "salon-boss-marketplace-management",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build:shared": "pnpm --filter @bossone/shared build",
+    "dev:api": "pnpm build:shared && pnpm --filter @bossone/api start:dev",
+    "dev:web": "pnpm build:shared && pnpm --filter @bossone/web dev",
+    "typecheck": "pnpm -r typecheck",
+    "build": "pnpm -r build"
+  }
+}
