@@ -1,0 +1,3 @@
+-- Intentionally empty.
+-- This migration's schema changes are included in 20261106175732_init.
+-- Retained to preserve the migration history and ordering.
