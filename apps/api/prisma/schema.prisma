@@ -1,0 +1,2264 @@
+// BOSSONE.LK - application database schema.
+//
+// RULES FOR THE TEAM
+// - Prisma Migrate is the ONLY tool that changes this schema. Do not create tables in Supabase Studio.
+// - SQL that Prisma cannot express (RLS policies, storage policies, Realtime triggers) goes into a
+//   Prisma migration as raw SQL: `pnpm --filter @bossone/api exec prisma migrate dev --create-only`,
+//   then edit the generated migration.sql before applying it.
+// - Every schema change is reviewed by the whole team in a pull request.
+// - Money is Decimal(12,2) in LKR. Never use Float for money.
+//
+// This file is the foundation (users, roles, catalogue, pricing, audit). Each member adds the
+// tables for their modules (orders, inventory, payments, delivery, QC, support...) in their own
+// migrations, following docs/database/README.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users and roles
+// ---------------------------------------------------------------------------
+
+enum UserType {
+  CUSTOMER
+  STAFF
+}
+
+enum UserStatus {
+  ACTIVE
+  DEACTIVATED
+  /// Customer deleted their account: personal data anonymised, orders and financial records kept.
+  DELETED
+}
+
+/// Keep in sync with ROLES in packages/shared/src/roles.ts
+enum RoleCode {
+  CUSTOMER
+  SERVICE_MANAGER
+  STOCK_MANAGER
+  QUALITY_CONTROLLER
+  DELIVERER
+  ACCOUNTANT
+  OWNER_ADMIN
+}
+
+/// Application user. Linked to Supabase Auth (auth.users) through `authUserId`.
+/// Staff records are created by the Owner/Admin BEFORE the person first signs in;
+/// on first sign-in the API links the Supabase account by matching email.
+model User {
+  id         String     @id @default(uuid()) @db.Uuid
+  authUserId String?    @unique @map("auth_user_id") @db.Uuid
+  email      String?    @unique
+  phone      String?    @unique
+  fullName   String?    @map("full_name")
+  /// Set when the phone number is confirmed with our SMS OTP (see PhoneOtp).
+  phoneVerifiedAt DateTime? @map("phone_verified_at")
+  /// Set when the customer deletes the account (H22).
+  deletedAt  DateTime?  @map("deleted_at")
+  userType   UserType   @map("user_type")
+  status     UserStatus @default(ACTIVE)
+  /// Staff number shown in the Owner's Staff & Accounts list, e.g. "EMP-014". Null for customers.
+  employeeCode String?  @unique @map("employee_code")
+  /// Set when the Owner suspends a staff account (status DEACTIVATED).
+  suspendedAt  DateTime? @map("suspended_at")
+  createdAt  DateTime   @default(now()) @map("created_at")
+  updatedAt  DateTime   @updatedAt @map("updated_at")
+
+  roles             UserRole[]      @relation("UserRoles")
+  rolesGranted      UserRole[]      @relation("RolesGrantedBy")
+  productsCreated   Product[]       @relation("ProductCreatedBy")
+  productsReviewed  Product[]       @relation("ProductReviewedBy")
+  priceChanges      PriceHistory[]
+  auditLogs         AuditLog[]
+
+  // Section A - customer account & verification
+  customerProfile       CustomerProfile?       @relation("CustomerProfileUser")
+  identityReviewed      CustomerProfile[]      @relation("IdentityReviewedBy")
+  salons                Salon[]                @relation("SalonOwner")
+  salonsReviewed        Salon[]                @relation("SalonReviewedBy")
+  addresses             Address[]
+  verificationDocuments VerificationDocument[]
+  verificationEvents    VerificationEvent[]    @relation("VerificationEventCustomer")
+  verificationActions   VerificationEvent[]    @relation("VerificationEventActor")
+  dataRequests          DataRequest[]
+  phoneOtps             PhoneOtp[]
+  cart                  Cart?
+  wishlistItems         WishlistItem[]
+  interests             CustomerInterest[]
+  preferredBrands       CustomerPreferredBrand[]
+  regularProducts       RegularProduct[]
+  orders                Order[]                @relation("OrderCustomer")
+  orderEvents           OrderEvent[]           @relation("OrderEventActor")
+
+  // Section D - order chats and support requests
+  supportThreads        SupportThread[]        @relation("ThreadCustomer")
+  assignedThreads       SupportThread[]        @relation("ThreadAssignee")
+  supportMessages       SupportMessage[]       @relation("MessageAuthorUser")
+  notifications         Notification[]
+  notificationSettings  NotificationSetting[]
+
+  // Production readiness - delivery, cancellations, credit notes, loyalty
+  cancellationRequests  CancellationRequest[]  @relation("CancellationCustomer")
+  cancellationDecisions CancellationRequest[]  @relation("CancellationDecider")
+  inspections           DeliveryInspection[]   @relation("InspectionCustomer")
+  codCollections        CodCollection[]        @relation("CodCollector")
+  creditNotes           CreditNote[]           @relation("CreditNoteCustomer")
+  creditNotesIssued     CreditNote[]           @relation("CreditNoteIssuer")
+  loyaltyEntries        LoyaltyEntry[]
+
+  // Owner workspace - see the "Owner workspace" section below
+  stockMovements        StockMovement[]        @relation("StockMovementActor")
+  stockCountsSubmitted  StockCount[]           @relation("StockCountSubmitter")
+  stockCountsDecided    StockCount[]           @relation("StockCountDecider")
+  stockCountsWitnessed  StockCount[]           @relation("StockCountWitness")
+  qcInspections         QcInspection[]         @relation("QcInspector")
+  qcPhotos              QcPhoto[]              @relation("QcPhotoUploader")
+  bannersCreated        Banner[]               @relation("BannerCreator")
+  bannersPublished      Banner[]               @relation("BannerPublisher")
+  bannerVersionsSubmitted BannerVersion[]      @relation("BannerVersionSubmitter")
+  bannerVersionsReviewed  BannerVersion[]      @relation("BannerVersionReviewer")
+  articlesCreated       HelpArticle[]          @relation("ArticleCreator")
+  articleVersionsSubmitted HelpArticleVersion[] @relation("ArticleVersionSubmitter")
+  articleVersionsReviewed  HelpArticleVersion[] @relation("ArticleVersionReviewer")
+  articlesPublished     HelpArticleLive[]      @relation("ArticlePublisher")
+  exceptionsRaised      BusinessException[]    @relation("ExceptionRaiser")
+  exceptionActions      ExceptionAction[]      @relation("ExceptionActionActor")
+  closingsPrepared      FinancialClosing[]     @relation("ClosingPreparer")
+  closingsReviewed      FinancialClosing[]     @relation("ClosingReviewer")
+  integrityCheckpoints  IntegrityCheckpoint[]
+  expensesCreated       Expense[]              @relation("ExpenseCreator")
+  businessGoals         BusinessGoal[]
+  goalsAssigned         Goal[]                 @relation("GoalAssignee")
+  goalsCreated          Goal[]                 @relation("GoalCreator")
+  goalRevisions         GoalRevision[]         @relation("GoalRevisionAuthor")
+
+  // Deliverer performance (demerit points)
+  demeritRulesChanged   DemeritRule[]          @relation("DemeritRuleAuthor")
+  violationsAgainst     DelivererViolation[]   @relation("ViolationDeliverer")
+  violationsReported    DelivererViolation[]   @relation("ViolationReporter")
+  violationsDecided     DelivererViolation[]   @relation("ViolationDecider")
+  violationActions      ViolationAction[]      @relation("ViolationActionActor")
+  returnsRaised         ReturnCase[]           @relation("ReturnCustomer")
+  returnsDecided        ReturnCase[]           @relation("ReturnDecider")
+  returnsReceived       ReturnCase[]           @relation("ReturnReceiver")
+  returnsInspected      ReturnCase[]           @relation("ReturnQc")
+  returnsClassified     ReturnCase[]           @relation("ReturnClassifier")
+  returnsClosed         ReturnCase[]           @relation("ReturnCloser")
+  returnEvents          ReturnCaseEvent[]      @relation("ReturnEventActor")
+  receiptsTaken         StockReceipt[]         @relation("ReceiptOfficer")
+  collectionsTaken      OrderCollection[]      @relation("CollectionOfficer")
+  packingsTaken         OrderPacking[]         @relation("PackingOfficer")
+  warehouseEvidence     WarehouseEvidence[]    @relation("WarehouseEvidenceAuthor")
+
+  @@map("users")
+}
+
+model UserRole {
+  userId      String   @map("user_id") @db.Uuid
+  role        RoleCode
+  grantedById String?  @map("granted_by_id") @db.Uuid
+  grantedAt   DateTime @default(now()) @map("granted_at")
+
+  user      User  @relation("UserRoles", fields: [userId], references: [id], onDelete: Cascade)
+  grantedBy User? @relation("RolesGrantedBy", fields: [grantedById], references: [id])
+
+  @@id([userId, role])
+  @@map("user_roles")
+}
+
+// ---------------------------------------------------------------------------
+// Catalogue
+// ---------------------------------------------------------------------------
+
+/// Keep in sync with PRODUCT_STATUSES in packages/shared/src/products.ts
+enum ProductStatus {
+  DRAFT
+  PENDING_APPROVAL
+  ACTIVE
+  REJECTED
+  DISCONTINUED
+}
+
+/// Brand shown on Explore Brands and its own brand store page.
+model Brand {
+  id            String    @id @default(uuid()) @db.Uuid
+  name          String    @unique
+  slug          String    @unique
+  /// Big word on the home "Featured Brands" card, e.g. "TAKARA". Defaults to the first word of name.
+  wordmark      String?
+  /// Gold line under the wordmark, e.g. "Professionnel Paris". Defaults to name.
+  wordmarkSub   String?   @map("wordmark_sub")
+  /// Short category label, e.g. "Salon Equipment".
+  specialty     String?
+  /// Tag on the home "Featured Brands" card, e.g. "EQUIPMENT", "BARBER".
+  cardTag       String?   @map("card_tag")
+  /// One line, e.g. "Hydraulic Chairs & Stations".
+  tagline       String?
+  description   String?
+  /// Two short chips on the brand card, e.g. ["230V Certified", "Heavy Duty 250kg"].
+  featureTags   String[]  @default([]) @map("feature_tags")
+  /// Chips on the brand store header, e.g. ["Origin: Milan, Italy", "Standard Voltage: 230V Compliant"].
+  highlights    String[]  @default([])
+  /// Badges next to the brand name, e.g. ["Official Trade Partner", "Direct Italian Line"].
+  partnerBadges String[]  @default([]) @map("partner_badges")
+  /// Official brand logo in the public "brand-files" bucket (e.g. logos/loreal.svg). Falls back to the wordmark.
+  logoPath      String?   @map("logo_path")
+  /// Monogram tile colour: DARK (black), NAVY or LIGHT.
+  tileStyle     String    @default("DARK") @map("tile_style")
+  featured      Boolean   @default(false)
+  sortOrder     Int       @default(0) @map("sort_order")
+  /// Optional PDF in the public "brand-files" bucket.
+  specSheetPath String?   @map("spec_sheet_path")
+  specSheetNote String?   @map("spec_sheet_note")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  products      Product[]
+  preferredBy   CustomerPreferredBrand[]
+
+  @@map("brands")
+}
+
+model Category {
+  id               String     @id @default(uuid()) @db.Uuid
+  name             String
+  slug             String     @unique
+  parentId         String?    @map("parent_id") @db.Uuid
+  /// Customer-facing groups for the category filter chips: "Hair", "Skin & Nails", "Equipment".
+  groupName        String?    @map("group_name")
+  /// Material Symbols icon name, e.g. "content_cut".
+  icon             String?
+  /// Short line for home cards, e.g. "Shampoos, Treatments & Backbar".
+  shortDescription String?    @map("short_description")
+  description      String?
+  /// Label on the category image, e.g. "Technical Formulations".
+  badge            String?
+  /// Path in the public "product-images" bucket.
+  imagePath        String?    @map("image_path")
+  sortOrder        Int        @default(0) @map("sort_order")
+  /// Only categories marked visible reach customers. The storefront sells professional hair products only,
+  /// so older catalogue categories (electricals, skin, nails, furniture) stay hidden unless the Owner shows them.
+  customerVisible  Boolean    @default(false) @map("customer_visible")
+  parent           Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children         Category[] @relation("CategoryTree")
+  createdAt        DateTime   @default(now()) @map("created_at")
+  products         Product[]
+  interestedCustomers CustomerInterest[]
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id              String        @id @default(uuid()) @db.Uuid
+  sku             String        @unique
+  name            String
+  description     String?
+  status          ProductStatus @default(DRAFT)
+  brandId         String?       @map("brand_id") @db.Uuid
+  categoryId      String?       @map("category_id") @db.Uuid
+  createdById     String        @map("created_by_id") @db.Uuid
+  reviewedById    String?       @map("reviewed_by_id") @db.Uuid
+  reviewedAt      DateTime?     @map("reviewed_at")
+  rejectionReason String?       @map("rejection_reason")
+  /// One-line description shown on cards.
+  summary         String?
+  /// Small type label on brand store cards, e.g. "Backwash", "Styling Chair".
+  typeLabel       String?       @map("type_label")
+  /// Short note next to the price, e.g. "Instant dispatch", "Pro Exclusive".
+  dispatchNote    String?       @map("dispatch_note")
+  /// Shown in "Featured Products" on the home page.
+  featured        Boolean       @default(false)
+  /// Summary of the active variants, kept up to date by ProductsService.refreshSummary().
+  /// Used for fast price sorting/filtering. Null listPrice = not priced = hidden from customers.
+  listPrice       Decimal?      @map("list_price") @db.Decimal(12, 2)
+  minMoq          Int           @default(1) @map("min_moq")
+  inStock         Boolean       @default(false) @map("in_stock")
+  /// Owner switch to hide a product from customers while stock remains. Separate from MOQ and stock.
+  customerVisible Boolean       @default(true) @map("customer_visible")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  brand      Brand?           @relation(fields: [brandId], references: [id])
+  category   Category?        @relation(fields: [categoryId], references: [id])
+  createdBy  User             @relation("ProductCreatedBy", fields: [createdById], references: [id])
+  reviewedBy User?            @relation("ProductReviewedBy", fields: [reviewedById], references: [id])
+  variants   ProductVariant[]
+  images     ProductImage[]
+  wishlistItems WishlistItem[]
+  regularFor    RegularProduct[]
+  orderItems    OrderItem[]
+
+  @@index([status])
+  @@index([featured])
+  @@index([status, listPrice])
+  @@index([brandId])
+  @@index([categoryId])
+  @@map("products")
+}
+
+model ProductVariant {
+  id           String   @id @default(uuid()) @db.Uuid
+  productId    String   @map("product_id") @db.Uuid
+  sku          String   @unique
+  name         String
+  /// e.g. {"size": "500ml", "shade": "Natural Black"}
+  attributes   Json     @default("{}")
+  /// Base selling price in LKR per sale unit (one item, or one pack when unitsPerPack is set),
+  /// set by the Accountant. Null = not yet priced (not sellable).
+  price        Decimal? @db.Decimal(12, 2)
+  /// Set when this variant is sold by the pack: how many individual units one pack contains.
+  /// Price, MOQ, stock and cart quantities then count packs. Null = sold as single units.
+  unitsPerPack Int?     @map("units_per_pack")
+  /// Effective minimum order quantity used by the cart and checkout. 0 = no minimum (never means out
+  /// of stock). Kept equal to moqOverride when set, otherwise to the default MOQ ("wholesale.defaultMoq").
+  moq          Int      @default(1)
+  /// Product-specific MOQ set by the Owner. Null = use the default MOQ.
+  moqOverride  Int?     @map("moq_override")
+  /// Allowed quantities go up in these steps from the MOQ (1 = any quantity).
+  orderIncrement Int    @default(1) @map("order_increment")
+  /// What one sale unit costs BOSSONE.LK (LKR), set by the Owner for profit reporting. Null = not known.
+  unitCost     Decimal? @map("unit_cost") @db.Decimal(12, 2)
+  /// Pack label on cards, e.g. "1500ml Backbar", "10 x 12ml Box".
+  packLabel    String?  @map("pack_label")
+  /// Customer-facing available quantity, controlled by the Accountant (Workflow 03).
+  /// Physical stock lives in the inventory module (Member 02).
+  availableQty Int      @default(0) @map("available_qty")
+  /// Shown when out of stock, e.g. "Next Shipment ETA: 4 Days".
+  restockNote  String?  @map("restock_note")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  product      Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  priceHistory PriceHistory[]
+  priceTiers   PriceTier[]
+  cartItems    CartItem[]
+  orderItems   OrderItem[]
+  inventory      InventoryLevel?
+  receiptLines   StockReceiptLine[]
+  stockMovements StockMovement[]
+  stockCountLines StockCountLine[]
+  exceptions     BusinessException[]
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+/// Volume pricing: from `minQty` units the unit price drops to `unitPrice`.
+model PriceTier {
+  id        String         @id @default(uuid()) @db.Uuid
+  variantId String         @map("variant_id") @db.Uuid
+  minQty    Int            @map("min_qty")
+  unitPrice Decimal        @map("unit_price") @db.Decimal(12, 2)
+  /// Optional name, e.g. "Salon Pro", "Distributor", "Case of 12".
+  label     String?
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([variantId, minQty])
+  @@map("price_tiers")
+}
+
+/// Path in the public "product-images" Supabase Storage bucket.
+model ProductImage {
+  id          String   @id @default(uuid()) @db.Uuid
+  productId   String   @map("product_id") @db.Uuid
+  storagePath String   @map("storage_path")
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+/// Every price change is recorded; prices are never silently overwritten.
+model PriceHistory {
+  id          String   @id @default(uuid()) @db.Uuid
+  variantId   String   @map("variant_id") @db.Uuid
+  oldPrice    Decimal? @map("old_price") @db.Decimal(12, 2)
+  newPrice    Decimal  @map("new_price") @db.Decimal(12, 2)
+  changedById String   @map("changed_by_id") @db.Uuid
+  reason      String?
+  changedAt   DateTime @default(now()) @map("changed_at")
+
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  changedBy User           @relation(fields: [changedById], references: [id])
+
+  @@index([variantId, changedAt])
+  @@map("price_history")
+}
+
+// ---------------------------------------------------------------------------
+// Administration
+// ---------------------------------------------------------------------------
+
+/// Never store passwords, tokens or private document contents here.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  oldValues  Json?    @map("old_values")
+  newValues  Json?    @map("new_values")
+  /// Roles the actor held when acting (empty = system action).
+  actorRoles String[] @default([]) @map("actor_roles")
+  /// Reason or comment given with the action, when one is required.
+  reason     String?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+model SystemSetting {
+  key         String   @id
+  value       Json
+  description String?
+  updatedById String?  @map("updated_by_id") @db.Uuid
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Section A - customer account, salons, addresses, verification (Member 01)
+// Workflow 01: register -> verify contact -> submit identity + salon -> staff review.
+// ---------------------------------------------------------------------------
+
+/// Keep in sync with VERIFICATION_STATUSES in packages/shared/src/customers.ts
+enum VerificationStatus {
+  NOT_SUBMITTED
+  PENDING_REVIEW
+  VERIFIED
+  CLARIFICATION_REQUIRED
+  REJECTED
+}
+
+/// Customer-level identity details (the salon owner / authorized buyer).
+model CustomerProfile {
+  userId           String             @id @map("user_id") @db.Uuid
+  fullLegalName    String?            @map("full_legal_name")
+  /// Sri Lankan NIC: 12 digits (new) or 9 digits + V/X (old). Never returned in full to clients.
+  nicNumber        String?            @map("nic_number")
+  designation      String?
+  deskPhone        String?            @map("desk_phone")
+  identityStatus   VerificationStatus @default(NOT_SUBMITTED) @map("identity_status")
+  identitySubmittedAt DateTime?       @map("identity_submitted_at")
+  identityReviewedAt  DateTime?       @map("identity_reviewed_at")
+  identityReviewedById String?        @map("identity_reviewed_by_id") @db.Uuid
+  /// Active salon used by default at checkout.
+  activeSalonId    String?            @map("active_salon_id") @db.Uuid
+  /// Public handle chosen at registration (letters, numbers, underscores). Can also be used to sign in.
+  username         String?            @unique
+  /// Birthday without the year (optional), used only for birthday greetings when allowed.
+  birthDay         Int?               @map("birth_day")
+  birthMonth       Int?               @map("birth_month")
+  /// Optional: birthday greetings and gifts. Separate from promotional marketing.
+  birthdayGreetings Boolean           @default(false) @map("birthday_greetings")
+  /// Optional: seasonal offers, samples and trade coupons.
+  marketingOptIn   Boolean            @default(false) @map("marketing_opt_in")
+  termsAcceptedAt  DateTime?          @map("terms_accepted_at")
+  privacyAcceptedAt DateTime?         @map("privacy_accepted_at")
+  /// Interface language for the customer screens.
+  preferredLanguage AppLanguage       @default(en) @map("preferred_language")
+  /// Optional shopping preference (R04).
+  restockFrequency RestockFrequency?  @map("restock_frequency")
+  /// Set when the customer finishes (or skips) the last registration step.
+  onboardingCompletedAt DateTime?     @map("onboarding_completed_at")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+
+  user               User  @relation("CustomerProfileUser", fields: [userId], references: [id], onDelete: Cascade)
+  identityReviewedBy User? @relation("IdentityReviewedBy", fields: [identityReviewedById], references: [id])
+
+  @@map("customer_profiles")
+}
+
+/// Supported interface languages for customer screens.
+enum AppLanguage {
+  en
+  si
+}
+
+enum RestockFrequency {
+  WEEKLY
+  EVERY_TWO_WEEKS
+  MONTHLY
+  EVERY_FEW_MONTHS
+  WHEN_NEEDED
+}
+
+/// Shopping preferences (R04): product types the customer is interested in. Personalisation only.
+model CustomerInterest {
+  userId     String   @map("user_id") @db.Uuid
+  categoryId String   @map("category_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([userId, categoryId])
+  @@map("customer_interests")
+}
+
+/// Shopping preferences (R04): brands the customer prefers. Personalisation only.
+model CustomerPreferredBrand {
+  userId    String   @map("user_id") @db.Uuid
+  brandId   String   @map("brand_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  brand Brand @relation(fields: [brandId], references: [id], onDelete: Cascade)
+
+  @@id([userId, brandId])
+  @@map("customer_preferred_brands")
+}
+
+/// "My Regular Products": specific products the customer expects to need regularly,
+/// even if never bought. Separate from general interests.
+model RegularProduct {
+  userId    String   @map("user_id") @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  /// The quantity the salon usually orders (sale units). Null = the product's minimum order.
+  quantity  Int?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([userId, productId])
+  @@map("regular_products")
+}
+
+/// A salon premises owned by a customer. Each order is placed for one salon.
+model Salon {
+  id              String             @id @default(uuid()) @db.Uuid
+  ownerId         String             @map("owner_id") @db.Uuid
+  tradeName       String             @map("trade_name")
+  branchTag       String?            @map("branch_tag")
+  phone           String
+  invoiceEmail    String?            @map("invoice_email")
+  businessRegNo   String?            @map("business_reg_no")
+  street          String
+  city            String
+  district        String
+  province        String
+  postalCode      String?            @map("postal_code")
+  latitude        Decimal?           @db.Decimal(9, 6)
+  longitude       Decimal?           @db.Decimal(9, 6)
+  liftGateRequired Boolean           @default(false) @map("lift_gate_required")
+  groundFloorBay  Boolean            @default(false) @map("ground_floor_bay")
+  forkliftAccess  Boolean            @default(false) @map("forklift_access")
+  status          VerificationStatus @default(NOT_SUBMITTED)
+  submittedAt     DateTime?          @map("submitted_at")
+  reviewedAt      DateTime?          @map("reviewed_at")
+  reviewedById    String?            @map("reviewed_by_id") @db.Uuid
+  archivedAt      DateTime?          @map("archived_at")
+  createdAt       DateTime           @default(now()) @map("created_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+
+  owner      User                   @relation("SalonOwner", fields: [ownerId], references: [id])
+  reviewedBy User?                  @relation("SalonReviewedBy", fields: [reviewedById], references: [id])
+  addresses  Address[]
+  documents  VerificationDocument[]
+  events     VerificationEvent[]
+
+  @@index([ownerId])
+  @@index([status])
+  @@map("salons")
+}
+
+/// Delivery address. Orders copy the address into a snapshot, so editing/deleting never changes old orders.
+model Address {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  salonId       String?   @map("salon_id") @db.Uuid
+  label         String
+  recipientName String    @map("recipient_name")
+  phone         String
+  line1         String
+  line2         String?
+  city          String
+  district      String
+  province      String
+  postalCode    String?   @map("postal_code")
+  latitude      Decimal?  @db.Decimal(9, 6)
+  longitude     Decimal?  @db.Decimal(9, 6)
+  driverNotes   String?   @map("driver_notes")
+  isDefault     Boolean   @default(false) @map("is_default")
+  deletedAt     DateTime? @map("deleted_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  salon  Salon?  @relation(fields: [salonId], references: [id])
+  orders Order[]
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+enum VerificationDocumentKind {
+  NIC_FRONT
+  NIC_BACK
+  SELFIE
+  SALON_PHOTO
+  BUSINESS_DOCUMENT
+  CLARIFICATION
+}
+
+/// A file in the private "verification-documents" bucket. Replaced files are kept (supersededAt) for audit.
+model VerificationDocument {
+  id           String                   @id @default(uuid()) @db.Uuid
+  userId       String                   @map("user_id") @db.Uuid
+  salonId      String?                  @map("salon_id") @db.Uuid
+  kind         VerificationDocumentKind
+  storagePath  String                   @unique @map("storage_path")
+  uploadedAt   DateTime                 @default(now()) @map("uploaded_at")
+  supersededAt DateTime?                @map("superseded_at")
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  salon Salon? @relation(fields: [salonId], references: [id])
+
+  @@index([userId, kind])
+  @@index([salonId])
+  @@map("verification_documents")
+}
+
+enum VerificationEventType {
+  SUBMITTED
+  RESUBMITTED
+  APPROVED
+  REJECTED
+  CLARIFICATION_REQUESTED
+  CLARIFICATION_RESPONDED
+}
+
+/// Verification history and clarification messages between the customer and staff.
+model VerificationEvent {
+  id         String                @id @default(uuid()) @db.Uuid
+  customerId String                @map("customer_id") @db.Uuid
+  salonId    String?               @map("salon_id") @db.Uuid
+  actorId    String                @map("actor_id") @db.Uuid
+  type       VerificationEventType
+  message    String?
+  createdAt  DateTime              @default(now()) @map("created_at")
+
+  customer User   @relation("VerificationEventCustomer", fields: [customerId], references: [id], onDelete: Cascade)
+  actor    User   @relation("VerificationEventActor", fields: [actorId], references: [id])
+  salon    Salon? @relation(fields: [salonId], references: [id])
+
+  @@index([customerId, createdAt])
+  @@index([salonId])
+  @@map("verification_events")
+}
+
+enum DataRequestType {
+  EXPORT
+  DELETION
+}
+
+enum DataRequestStatus {
+  REQUESTED
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+}
+
+/// Privacy requests (A12). Handled by staff; deletion anonymizes personal data but keeps business records.
+model DataRequest {
+  id          String            @id @default(uuid()) @db.Uuid
+  userId      String            @map("user_id") @db.Uuid
+  type        DataRequestType
+  status      DataRequestStatus @default(REQUESTED)
+  reason      String?
+  createdAt   DateTime          @default(now()) @map("created_at")
+  completedAt DateTime?         @map("completed_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("data_requests")
+}
+
+/// One-time SMS codes for phone verification. Only a hash of the code is stored.
+model PhoneOtp {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  phone      String
+  codeHash   String    @map("code_hash")
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("phone_otps")
+}
+
+// ---------------------------------------------------------------------------
+// Shopping (Section B)
+// ---------------------------------------------------------------------------
+
+/// One open cart per customer. Prices are calculated live; orders take the price snapshot.
+model Cart {
+  id        String     @id @default(uuid()) @db.Uuid
+  userId    String     @unique @map("user_id") @db.Uuid
+  updatedAt DateTime   @updatedAt @map("updated_at")
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     CartItem[]
+
+  @@map("carts")
+}
+
+model CartItem {
+  id        String         @id @default(uuid()) @db.Uuid
+  cartId    String         @map("cart_id") @db.Uuid
+  variantId String         @map("variant_id") @db.Uuid
+  quantity  Int
+  addedAt   DateTime       @default(now()) @map("added_at")
+  cart      Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([cartId, variantId])
+  @@map("cart_items")
+}
+
+model WishlistItem {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  productId     String   @map("product_id") @db.Uuid
+  addedAt       DateTime @default(now()) @map("added_at")
+  /// Price of the main variant when saved, to show "Price updated" later.
+  savedPrice    Decimal? @map("saved_price") @db.Decimal(12, 2)
+  /// Send a notification when this product is back in stock.
+  notifyRestock Boolean  @default(false) @map("notify_restock")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, productId])
+  @@map("wishlist_items")
+}
+
+// ---------------------------------------------------------------------------
+// Orders (Section C): checkout, payment and delivery tracking
+// Keep the enums in sync with packages/shared/src/orders.ts
+// ---------------------------------------------------------------------------
+
+enum OrderStatus {
+  PLACED
+  PICKED
+  QC_PASSED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+/// Only cash on delivery and online payment. No bank transfer, bank slip or manual mark-as-paid.
+enum PaymentMethod {
+  CASH_ON_DELIVERY
+  ONLINE_CARD
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+/// A placed order. Prices, product names and the delivery address are copied in (snapshot),
+/// so later price or catalogue changes never alter an order.
+model Order {
+  id            String        @id @default(uuid()) @db.Uuid
+  /// Running number shown as BO-<year>-00125.
+  number        Int           @unique @default(autoincrement())
+  userId        String        @map("user_id") @db.Uuid
+  /// Made by the browser for one checkout; stops a double click creating two orders.
+  checkoutToken String        @unique @map("checkout_token") @db.Uuid
+  status        OrderStatus   @default(PLACED)
+  paymentMethod PaymentMethod @map("payment_method")
+  paymentStatus PaymentStatus @default(PENDING) @map("payment_status")
+  paymentRef    String?       @map("payment_ref")
+  paidAt        DateTime?     @map("paid_at")
+  subtotal      Decimal       @db.Decimal(12, 2)
+  /// Loyalty level discount applied when the order was placed (configured benefit only).
+  discount      Decimal       @default(0) @db.Decimal(12, 2)
+  discountLabel String?       @map("discount_label")
+  deliveryFee   Decimal       @map("delivery_fee") @db.Decimal(12, 2)
+  total         Decimal       @db.Decimal(12, 2)
+  itemCount     Int           @map("item_count")
+  unitCount     Int           @map("unit_count")
+
+  // Delivery address snapshot
+  addressId     String?       @map("address_id") @db.Uuid
+  shipLabel     String        @map("ship_label")
+  shipName      String        @map("ship_name")
+  shipPhone     String        @map("ship_phone")
+  shipLine1     String        @map("ship_line1")
+  shipLine2     String?       @map("ship_line2")
+  shipCity      String        @map("ship_city")
+  shipDistrict  String        @map("ship_district")
+  shipProvince  String        @map("ship_province")
+  shipPostal    String?       @map("ship_postal")
+  notes         String?
+
+  placedAt      DateTime      @default(now()) @map("placed_at")
+  deliveredAt   DateTime?     @map("delivered_at")
+  /// Deliverer reported arriving at the branch; the customer can inspect until delivery is recorded.
+  arrivedAt     DateTime?     @map("arrived_at")
+  /// Cash collected by the Deliverer so far (sum of cod_collections). PAID only when it reaches the total.
+  codCollected  Decimal       @default(0) @map("cod_collected") @db.Decimal(12, 2)
+  cancelledAt   DateTime?     @map("cancelled_at")
+  cancelReason  String?       @map("cancel_reason")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  user    User         @relation("OrderCustomer", fields: [userId], references: [id])
+  address Address?     @relation(fields: [addressId], references: [id], onDelete: SetNull)
+  items   OrderItem[]
+  events  OrderEvent[]
+  thread  SupportThread?
+  cancellationRequests CancellationRequest[]
+  inspection           DeliveryInspection?
+  codCollections       CodCollection[]
+  creditNotes          CreditNote[]
+  loyaltyEntries       LoyaltyEntry[]
+  stockMovements       StockMovement[]
+  exceptions           BusinessException[]
+  violations           DelivererViolation[]
+  returnCase           ReturnCase?
+  collection           OrderCollection?
+  qcInspections        QcInspection[]
+  packing              OrderPacking?
+
+  @@index([userId, placedAt])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id           String          @id @default(uuid()) @db.Uuid
+  orderId      String          @map("order_id") @db.Uuid
+  productId    String?         @map("product_id") @db.Uuid
+  variantId    String?         @map("variant_id") @db.Uuid
+  sku          String
+  productName  String          @map("product_name")
+  brandName    String?         @map("brand_name")
+  variantName  String          @map("variant_name")
+  packLabel    String?         @map("pack_label")
+  unitsPerPack Int?            @map("units_per_pack")
+  /// MOQ and order step when the order was placed (later wholesale changes never alter old orders).
+  moq            Int?          @map("moq")
+  orderIncrement Int?          @map("order_increment")
+  imagePath    String?         @map("image_path")
+  quantity     Int
+  unitPrice    Decimal         @map("unit_price") @db.Decimal(12, 2)
+  lineTotal    Decimal         @map("line_total") @db.Decimal(12, 2)
+
+  order   Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  variant ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  inspectionLines InspectionLine[]
+  creditNoteLines CreditNoteLine[]
+  returnLines     ReturnCaseLine[]
+  collectionLines OrderCollectionLine[]
+  qcLines         QcInspectionLine[]
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+/// Timeline of an order: one row per status change (and payment notes).
+model OrderEvent {
+  id        String      @id @default(uuid()) @db.Uuid
+  orderId   String      @map("order_id") @db.Uuid
+  status    OrderStatus
+  note      String?
+  actorId   String?     @map("actor_id") @db.Uuid
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actor User? @relation("OrderEventActor", fields: [actorId], references: [id])
+
+  @@index([orderId, createdAt])
+  @@map("order_events")
+}
+
+/* ============================================================
+ * Section D - Order chats (H08) and support requests (H10)
+ * ============================================================ */
+
+enum ThreadKind {
+  ORDER
+  SUPPORT
+}
+
+/// OPEN = waiting for the team, WAITING_CUSTOMER = the team replied, RESOLVED = closed.
+enum ThreadStatus {
+  OPEN
+  WAITING_CUSTOMER
+  RESOLVED
+}
+
+enum HelpTopic {
+  ACCOUNT
+  SHOPPING
+  PRODUCTS
+  PAYMENTS
+  WEBSITE
+  OTHER
+}
+
+enum MessageAuthor {
+  CUSTOMER
+  STAFF
+  SYSTEM
+}
+
+/// A conversation: one per order (kind ORDER) or one per support request (kind SUPPORT).
+model SupportThread {
+  id             String        @id @default(uuid()) @db.Uuid
+  /// Running number shown as HELP-00125 for support requests.
+  number         Int           @unique @default(autoincrement())
+  kind           ThreadKind
+  customerId     String        @map("customer_id") @db.Uuid
+  orderId        String?       @unique @map("order_id") @db.Uuid
+  subject        String
+  topic          HelpTopic?
+  status         ThreadStatus  @default(OPEN)
+  assignedToId   String?       @map("assigned_to_id") @db.Uuid
+  lastMessageAt  DateTime      @default(now()) @map("last_message_at")
+  /// When the customer / the team last opened the conversation (for unread counts).
+  customerReadAt DateTime?     @map("customer_read_at")
+  staffReadAt    DateTime?     @map("staff_read_at")
+  resolvedAt     DateTime?     @map("resolved_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  customer   User             @relation("ThreadCustomer", fields: [customerId], references: [id])
+  assignedTo User?            @relation("ThreadAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  order      Order?           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  messages   SupportMessage[]
+
+  @@index([customerId, kind, lastMessageAt])
+  @@index([kind, status, lastMessageAt])
+  @@map("support_threads")
+}
+
+model SupportMessage {
+  id             String        @id @default(uuid()) @db.Uuid
+  threadId       String        @map("thread_id") @db.Uuid
+  authorId       String?       @map("author_id") @db.Uuid
+  author         MessageAuthor
+  body           String        @db.Text
+  /// Set for system notes (CHAT_STARTED, ORDER_STATUS, ...); the app translates them.
+  event          String?
+  attachmentPath String?       @map("attachment_path")
+  attachmentName String?       @map("attachment_name")
+  attachmentType String?       @map("attachment_type")
+  attachmentSize Int?          @map("attachment_size")
+  /// Internal staff note on an order chat. Never returned to the customer.
+  internal       Boolean       @default(false)
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  thread     SupportThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  authorUser User?         @relation("MessageAuthorUser", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([threadId, createdAt])
+  @@map("support_messages")
+}
+
+/* ============================================================
+ * Notification centre (H18)
+ * Keep the enum in sync with packages/shared/src/notifications.ts
+ * ============================================================ */
+
+enum NotificationCategory {
+  ORDERS
+  PAYMENTS
+  DELIVERY
+  SUPPORT
+  PRODUCTS
+  ACCOUNT
+}
+
+/// One notice for one customer. `kind` + `params` are turned into text by the website.
+model Notification {
+  id        String               @id @default(uuid()) @db.Uuid
+  userId    String               @map("user_id") @db.Uuid
+  category  NotificationCategory
+  kind      String
+  params    Json                 @default("{}")
+  priority  Boolean              @default(false)
+  readAt    DateTime?            @map("read_at")
+  createdAt DateTime             @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+/// A category the customer switched off. No row = switched on.
+model NotificationSetting {
+  userId   String               @map("user_id") @db.Uuid
+  category NotificationCategory
+  enabled  Boolean              @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, category])
+  @@map("notification_settings")
+}
+
+/* ---------------- Production readiness: cancellations, delivery, credit notes, loyalty ---------------- */
+
+enum CancellationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+/// Customers ask; the Accountant decides. Approval cancels the order and releases the reserved stock.
+model CancellationRequest {
+  id           String             @id @default(uuid()) @db.Uuid
+  orderId      String             @map("order_id") @db.Uuid
+  customerId   String             @map("customer_id") @db.Uuid
+  reason       String
+  status       CancellationStatus @default(PENDING)
+  decidedById  String?            @map("decided_by_id") @db.Uuid
+  decisionNote String?            @map("decision_note")
+  decidedAt    DateTime?          @map("decided_at")
+  createdAt    DateTime           @default(now()) @map("created_at")
+
+  order     Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customer  User  @relation("CancellationCustomer", fields: [customerId], references: [id])
+  decidedBy User? @relation("CancellationDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+  @@index([status, createdAt])
+  @@map("cancellation_requests")
+}
+
+enum InspectionStatus {
+  IN_PROGRESS
+  SUBMITTED
+}
+
+/// The customer's check of the goods at the door, while the Deliverer is present (H09). One per order.
+model DeliveryInspection {
+  id          String           @id @default(uuid()) @db.Uuid
+  orderId     String           @unique @map("order_id") @db.Uuid
+  customerId  String           @map("customer_id") @db.Uuid
+  status      InspectionStatus @default(IN_PROGRESS)
+  note        String?
+  startedAt   DateTime         @default(now()) @map("started_at")
+  submittedAt DateTime?        @map("submitted_at")
+
+  order    Order                @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customer User                 @relation("InspectionCustomer", fields: [customerId], references: [id])
+  lines      InspectionLine[]
+  evidence   InspectionEvidence[]
+  returnCase ReturnCase?
+
+  @@map("delivery_inspections")
+}
+
+/// accepted + damaged + missing + incorrect + rejected = ordered quantity.
+model InspectionLine {
+  id           String  @id @default(uuid()) @db.Uuid
+  inspectionId String  @map("inspection_id") @db.Uuid
+  orderItemId  String  @map("order_item_id") @db.Uuid
+  accepted     Int
+  damaged      Int     @default(0)
+  missing      Int     @default(0)
+  incorrect    Int     @default(0)
+  rejected     Int     @default(0)
+  note         String?
+
+  inspection DeliveryInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  orderItem  OrderItem          @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@unique([inspectionId, orderItemId])
+  @@map("inspection_lines")
+}
+
+/// Live photo or video in the private delivery-evidence bucket. confirmedAt is set once the upload exists.
+model InspectionEvidence {
+  id           String    @id @default(uuid()) @db.Uuid
+  inspectionId String    @map("inspection_id") @db.Uuid
+  orderItemId  String?   @map("order_item_id") @db.Uuid
+  storagePath  String    @map("storage_path")
+  fileName     String    @map("file_name")
+  mimeType     String    @map("mime_type")
+  size         Int
+  confirmedAt  DateTime? @map("confirmed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  inspection DeliveryInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  @@index([inspectionId])
+  @@map("inspection_evidence")
+}
+
+/* ============================================================
+ * Customer returns (specification §14.2).
+ *
+ * The delivery inspection is where the customer records what was damaged, missing, wrong or
+ * refused, with live evidence. A return case is the step after that: the customer says what
+ * outcome they are asking for, the Accountant decides the financial outcome and whether the goods
+ * come back, QC verifies what actually arrived, and the Stock Manager makes the final Restock /
+ * Quarantine / Damaged classification. Each step belongs to one role and is recorded; no step is
+ * ever performed automatically, and the Owner only oversees.
+ * ============================================================ */
+
+/// What the customer asks for. The Accountant decides what actually happens (§14.2 step 4).
+enum ReturnOutcome {
+  /// Send the affected units again.
+  REPLACEMENT
+  /// Money back, through the Accountant's refund process.
+  REFUND
+  /// A credit note to use against future orders.
+  CREDIT_NOTE
+}
+
+enum ReturnCaseStatus {
+  /// The customer has asked; waiting for the Accountant's decision.
+  OPEN
+  /// The Accountant authorised a physical return; waiting for the goods.
+  AWAITING_RETURN
+  /// The goods are back in the warehouse; waiting for QC.
+  RECEIVED
+  /// QC recorded the actual quantities and findings; waiting for the Stock Manager.
+  QC_VERIFIED
+  /// The Stock Manager classified every returned unit.
+  CLASSIFIED
+  /// The Accountant finished the financial outcome. Nothing further is expected.
+  CLOSED
+  /// The Accountant decided the goods stay with the customer. The financial outcome still applies.
+  NO_RETURN_REQUIRED
+}
+
+/// Where a returned unit ended up, decided by the Stock Manager after QC (§14.2 step 8).
+enum ReturnClassification {
+  RESTOCK
+  QUARANTINE
+  DAMAGED
+}
+
+/// One case per order: the customer's request and its progress through the departments.
+model ReturnCase {
+  id           String           @id @default(uuid()) @db.Uuid
+  /// Shown as RT-00012.
+  number       Int              @unique @default(autoincrement())
+  orderId      String           @unique @map("order_id") @db.Uuid
+  customerId   String           @map("customer_id") @db.Uuid
+  /// The submitted delivery inspection this case follows from.
+  inspectionId String           @unique @map("inspection_id") @db.Uuid
+  status       ReturnCaseStatus @default(OPEN)
+  /// What the customer asked for. Never changed once the case is open.
+  requestedOutcome ReturnOutcome @map("requested_outcome")
+  customerNote String?          @map("customer_note")
+  createdAt    DateTime         @default(now()) @map("created_at")
+
+  /// The Accountant's decision (§14.2 step 4).
+  decidedOutcome    ReturnOutcome? @map("decided_outcome")
+  returnAuthorised  Boolean?       @map("return_authorised")
+  decisionNote      String?        @map("decision_note")
+  decidedById       String?        @map("decided_by_id") @db.Uuid
+  decidedAt         DateTime?      @map("decided_at")
+
+  /// The Stock Manager recording that the goods are back.
+  receivedById String?   @map("received_by_id") @db.Uuid
+  receivedAt   DateTime? @map("received_at")
+
+  /// QC's verification of what arrived.
+  qcById   String?   @map("qc_by_id") @db.Uuid
+  qcAt     DateTime? @map("qc_at")
+  qcNote   String?   @map("qc_note")
+
+  /// The Stock Manager's final classification of every unit.
+  classifiedById String?   @map("classified_by_id") @db.Uuid
+  classifiedAt   DateTime? @map("classified_at")
+
+  /// The Accountant closing the case once the financial outcome is done.
+  closedById   String?   @map("closed_by_id") @db.Uuid
+  closedAt     DateTime? @map("closed_at")
+  closingNote  String?   @map("closing_note")
+
+  order        Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customer     User               @relation("ReturnCustomer", fields: [customerId], references: [id])
+  inspection   DeliveryInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  decidedBy    User?              @relation("ReturnDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+  receivedBy   User?              @relation("ReturnReceiver", fields: [receivedById], references: [id], onDelete: SetNull)
+  qcBy         User?              @relation("ReturnQc", fields: [qcById], references: [id], onDelete: SetNull)
+  classifiedBy User?              @relation("ReturnClassifier", fields: [classifiedById], references: [id], onDelete: SetNull)
+  closedBy     User?              @relation("ReturnCloser", fields: [closedById], references: [id], onDelete: SetNull)
+  lines        ReturnCaseLine[]
+  events       ReturnCaseEvent[]
+
+  @@index([status, createdAt])
+  @@index([customerId, createdAt])
+  @@map("return_cases")
+}
+
+/// One product on a return case. requestedQty comes from the inspection; QC records what arrived
+/// and the Stock Manager splits it into restocked, quarantined and damaged units.
+model ReturnCaseLine {
+  id            String  @id @default(uuid()) @db.Uuid
+  caseId        String  @map("case_id") @db.Uuid
+  orderItemId   String  @map("order_item_id") @db.Uuid
+  /// Units the customer reported as damaged, missing, incorrect or refused.
+  requestedQty  Int     @map("requested_qty")
+  /// Units QC actually received and checked. Null until QC has verified.
+  verifiedQty   Int?    @map("verified_qty")
+  qcNote        String? @map("qc_note")
+  /// QC's own condition breakdown of the verified units. Null until QC has filled it in.
+  /// The Stock Manager uses these as a recommendation; the final classification is still theirs.
+  qcGoodQty     Int?    @map("qc_good_qty")
+  qcDamagedQty  Int?    @map("qc_damaged_qty")
+  qcReviewQty   Int?    @map("qc_review_qty")
+  restockedQty  Int     @default(0) @map("restocked_qty")
+  quarantinedQty Int    @default(0) @map("quarantined_qty")
+  damagedQty    Int     @default(0) @map("damaged_qty")
+
+  case      ReturnCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  orderItem OrderItem  @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@unique([caseId, orderItemId])
+  @@map("return_case_lines")
+}
+
+/// Every step taken on a case: who, when, and the note they left. Never edited or deleted.
+model ReturnCaseEvent {
+  id        String           @id @default(uuid()) @db.Uuid
+  caseId    String           @map("case_id") @db.Uuid
+  status    ReturnCaseStatus
+  note      String?
+  actorId   String?          @map("actor_id") @db.Uuid
+  actorRole RoleCode?        @map("actor_role")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  case  ReturnCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  actor User?      @relation("ReturnEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([caseId, createdAt])
+  @@map("return_case_events")
+}
+
+/// Cash the Deliverer collected. Several rows = partial collections.
+model CodCollection {
+  id            String   @id @default(uuid()) @db.Uuid
+  orderId       String   @map("order_id") @db.Uuid
+  amount        Decimal  @db.Decimal(12, 2)
+  note          String?
+  collectedById String   @map("collected_by_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  order       Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  collectedBy User  @relation("CodCollector", fields: [collectedById], references: [id])
+
+  @@index([orderId])
+  @@map("cod_collections")
+}
+
+/// Issued by the Accountant against an order. Never removes or edits the original invoice.
+model CreditNote {
+  id         String   @id @default(uuid()) @db.Uuid
+  number     Int      @unique @default(autoincrement())
+  orderId    String   @map("order_id") @db.Uuid
+  customerId String   @map("customer_id") @db.Uuid
+  reason     String
+  amount     Decimal  @db.Decimal(12, 2)
+  issuedById String   @map("issued_by_id") @db.Uuid
+  issuedAt   DateTime @default(now()) @map("issued_at")
+
+  order    Order            @relation(fields: [orderId], references: [id])
+  customer User             @relation("CreditNoteCustomer", fields: [customerId], references: [id])
+  issuedBy User             @relation("CreditNoteIssuer", fields: [issuedById], references: [id])
+  lines    CreditNoteLine[]
+
+  @@index([customerId, issuedAt])
+  @@map("credit_notes")
+}
+
+model CreditNoteLine {
+  id           String  @id @default(uuid()) @db.Uuid
+  creditNoteId String  @map("credit_note_id") @db.Uuid
+  orderItemId  String  @map("order_item_id") @db.Uuid
+  quantity     Int
+  unitPrice    Decimal @map("unit_price") @db.Decimal(12, 2)
+  amount       Decimal @db.Decimal(12, 2)
+
+  creditNote CreditNote @relation(fields: [creditNoteId], references: [id], onDelete: Cascade)
+  orderItem  OrderItem  @relation(fields: [orderItemId], references: [id])
+
+  @@map("credit_note_lines")
+}
+
+enum LoyaltyEntryKind {
+  EARNED
+  REVERSED
+  ADJUSTED
+}
+
+/// Points ledger written by the server only. The balance is the sum of points.
+model LoyaltyEntry {
+  id        String           @id @default(uuid()) @db.Uuid
+  userId    String           @map("user_id") @db.Uuid
+  orderId   String?          @map("order_id") @db.Uuid
+  kind      LoyaltyEntryKind
+  points    Int
+  note      String?
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  /// One EARNED entry per order.
+  @@unique([orderId, kind])
+  @@index([userId, createdAt])
+  @@map("loyalty_entries")
+}
+
+// ===========================================================================
+// Owner workspace (Main Owner/Admin)
+// The Owner monitors, configures, reviews and decides. Department staff do the daily work and
+// submit items for review. Every decision is kept: submitted versions, decisions and the
+// previous/new values of changes are never overwritten.
+// Keep the enums in sync with packages/shared/src/owner.ts
+// ===========================================================================
+
+// ---------------- Stock ----------------
+
+/// A stock location (warehouse, store room, shelf area). The physical warehouse layout is not
+/// fixed yet, so the Owner records whatever locations exist; nothing else depends on a topology.
+model StockLocation {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  note      String?
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  levels   InventoryLevel[]
+  receipts StockReceipt[]
+  counts   StockCount[]
+
+  @@map("stock_locations")
+}
+
+/// Physical stock of one variant. Damaged and quarantined units are part of physical stock.
+/// Available = physical - reserved - damaged - quarantined. Reserved is worked out from open orders
+/// (placed, picked, QC passed), so it can never drift from the orders themselves.
+/// Quantities change only through StockMovement rows.
+model InventoryLevel {
+  variantId      String   @id @map("variant_id") @db.Uuid
+  physicalQty    Int      @default(0) @map("physical_qty")
+  damagedQty     Int      @default(0) @map("damaged_qty")
+  quarantinedQty Int      @default(0) @map("quarantined_qty")
+  /// Low-stock warning level. Null = not configured (no low-stock warning).
+  lowStockAt     Int?     @map("low_stock_at")
+  locationId     String?  @map("location_id") @db.Uuid
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  variant  ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  location StockLocation? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+
+  @@index([locationId])
+  @@map("inventory_levels")
+}
+
+enum StockMovementKind {
+  RECEIVED
+  DISPATCHED
+  COUNT_ADJUSTMENT
+  CORRECTION
+  MARKED_DAMAGED
+  WRITTEN_OFF
+  QUARANTINED
+  RELEASED_FROM_QUARANTINE
+  RETURN_RESTOCKED
+}
+
+/// Ledger of every stock change (who, what, why). Never edited or deleted.
+model StockMovement {
+  id               String            @id @default(uuid()) @db.Uuid
+  variantId        String            @map("variant_id") @db.Uuid
+  kind             StockMovementKind
+  physicalDelta    Int               @default(0) @map("physical_delta")
+  damagedDelta     Int               @default(0) @map("damaged_delta")
+  quarantinedDelta Int               @default(0) @map("quarantined_delta")
+  orderId          String?           @map("order_id") @db.Uuid
+  stockCountId     String?           @map("stock_count_id") @db.Uuid
+  exceptionId      String?           @map("exception_id") @db.Uuid
+  reason           String?
+  actorId          String?           @map("actor_id") @db.Uuid
+  createdAt        DateTime          @default(now()) @map("created_at")
+
+  variant    ProductVariant     @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  order      Order?             @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  stockCount StockCount?        @relation(fields: [stockCountId], references: [id], onDelete: SetNull)
+  exception  BusinessException? @relation(fields: [exceptionId], references: [id], onDelete: SetNull)
+  actor      User?              @relation("StockMovementActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([variantId, createdAt])
+  @@index([createdAt])
+  @@map("stock_movements")
+}
+
+
+/// Quality control (workflow 7). One inspection is one pass over one order's items by one
+/// inspector. An order that fails is inspected again, so an order can have several inspections;
+/// the newest one is the one that counts. Recorded quantities and checks are never edited after
+/// the inspection is completed.
+enum QcResult {
+  IN_PROGRESS
+  PASSED
+  FAILED
+}
+
+model QcInspection {
+  id           String    @id @default(uuid()) @db.Uuid
+  /// Shown as QC-00012.
+  number       Int       @unique @default(autoincrement())
+  orderId      String    @map("order_id") @db.Uuid
+  result       QcResult  @default(IN_PROGRESS)
+  /// True when an earlier inspection of this order failed.
+  reinspection Boolean   @default(false)
+  inspectorId  String    @map("inspector_id") @db.Uuid
+  startedAt    DateTime  @default(now()) @map("started_at")
+  completedAt  DateTime? @map("completed_at")
+  note         String?
+  /// Reference written on the physical QC sticker applied to the sealed carton.
+  stickerRef   String?   @map("sticker_ref")
+
+  order     Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  inspector User               @relation("QcInspector", fields: [inspectorId], references: [id])
+  lines     QcInspectionLine[]
+  photos    QcPhoto[]
+
+  @@index([orderId, startedAt])
+  @@index([result, startedAt])
+  @@map("qc_inspections")
+}
+
+/// One product on the inspection. passedQty + failedQty may not exceed the quantity the warehouse
+/// collected. A check is null until the inspector answers it.
+model QcInspectionLine {
+  id           String   @id @default(uuid()) @db.Uuid
+  inspectionId String   @map("inspection_id") @db.Uuid
+  orderItemId  String   @map("order_item_id") @db.Uuid
+  passedQty    Int      @default(0) @map("passed_qty")
+  failedQty    Int      @default(0) @map("failed_qty")
+  labelOk      Boolean? @map("label_ok")
+  quantityOk   Boolean? @map("quantity_ok")
+  sealOk       Boolean? @map("seal_ok")
+  conditionOk  Boolean? @map("condition_ok")
+  expiryOk     Boolean? @map("expiry_ok")
+  defectNote   String?  @map("defect_note")
+  checkedAt    DateTime? @map("checked_at")
+
+  inspection QcInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  orderItem  OrderItem    @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  photos     QcPhoto[]
+
+  @@unique([inspectionId, orderItemId])
+  @@map("qc_inspection_lines")
+}
+
+/// Evidence photo in the private "stock-evidence" bucket. Attached to the inspection, and to one
+/// product when the inspector took it while checking that product.
+model QcPhoto {
+  id           String   @id @default(uuid()) @db.Uuid
+  inspectionId String   @map("inspection_id") @db.Uuid
+  lineId       String?  @map("line_id") @db.Uuid
+  storagePath  String   @map("storage_path")
+  fileName     String   @map("file_name")
+  mimeType     String   @map("mime_type")
+  size         Int
+  caption      String?
+  uploadedById String   @map("uploaded_by_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  inspection QcInspection      @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  line       QcInspectionLine? @relation(fields: [lineId], references: [id], onDelete: SetNull)
+  uploadedBy User              @relation("QcPhotoUploader", fields: [uploadedById], references: [id])
+
+  @@index([inspectionId])
+  @@map("qc_photos")
+}
+
+enum StockCountStatus {
+  /// Being counted on the floor. Only its author sees it; the Owner never does.
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  CORRECTION_REQUESTED
+}
+
+/// A physical stock count by the Stock Manager. Differences go to the Owner for a decision.
+/// The counted quantities are never changed; a correction is a new count that `revises` this one.
+model StockCount {
+  id            String           @id @default(uuid()) @db.Uuid
+  /// Shown as SC-00012.
+  number        Int              @unique @default(autoincrement())
+  status        StockCountStatus @default(SUBMITTED)
+  note          String?
+  revisesId     String?          @unique @map("revises_id") @db.Uuid
+  submittedById String           @map("submitted_by_id") @db.Uuid
+  submittedAt   DateTime         @default(now()) @map("submitted_at")
+  /// A second staff member who watched the count, when the warehouse works in pairs.
+  witnessId     String?          @map("witness_id") @db.Uuid
+  /// The bay or zone counted, when the count was scoped to one.
+  locationId    String?          @map("location_id") @db.Uuid
+  decidedById   String?          @map("decided_by_id") @db.Uuid
+  decidedAt     DateTime?        @map("decided_at")
+  decisionNote  String?          @map("decision_note")
+
+  revises     StockCount?     @relation("StockCountRevision", fields: [revisesId], references: [id], onDelete: SetNull)
+  revisedBy   StockCount?     @relation("StockCountRevision")
+  submittedBy User            @relation("StockCountSubmitter", fields: [submittedById], references: [id])
+  witness     User?           @relation("StockCountWitness", fields: [witnessId], references: [id], onDelete: SetNull)
+  location    StockLocation?  @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  decidedBy   User?           @relation("StockCountDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+  lines       StockCountLine[]
+  movements   StockMovement[]
+
+  @@index([status, submittedAt])
+  @@map("stock_counts")
+}
+
+model StockCountLine {
+  id           String  @id @default(uuid()) @db.Uuid
+  countId      String  @map("count_id") @db.Uuid
+  variantId    String  @map("variant_id") @db.Uuid
+  /// Physical quantity in the system when the count was submitted.
+  systemQty    Int     @map("system_qty")
+  countedQty   Int     @map("counted_qty")
+  reason       String?
+  /// Photo in the private "stock-evidence" bucket.
+  evidencePath String? @map("evidence_path")
+
+  count   StockCount     @relation(fields: [countId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([countId, variantId])
+  @@map("stock_count_lines")
+}
+
+/* ============================================================
+ * Stock Manager workspace: receiving, order collection and packing.
+ *
+ * Three recorded stages of the Stock Manager's own work (specification §14.1, steps 4-6):
+ *   - A receipt (GRN) logs stock arriving at the warehouse, what the bill said and what was
+ *     physically counted. Confirming it is what adds the units to physical stock.
+ *   - A collection logs what was actually picked for one customer order against the warehouse
+ *     release bill, with photo proof. A short pick raises a collection-shortage exception.
+ *   - A packing record logs the cartons, the tamper seal and the notes before the order is handed
+ *     to Quality Control.
+ *
+ * None of these ever decides anything: QC still inspects, the Accountant still handles money, and
+ * the Owner only oversees. Supplier and purchasing management stay out of this release, so a
+ * consignor is recorded as text with its bill reference, not as a supplier record.
+ * ============================================================ */
+
+enum ReceiptSource {
+  /// Bought in directly on an external purchase order.
+  EXTERNAL_PO
+  /// Moved in from the business's own main warehouse or another hub.
+  OWNER_HUB
+  /// Returned to stock from another part of the business.
+  INTERNAL_TRANSFER
+}
+
+enum WarehouseRecordStatus {
+  /// Being filled in. Nothing has touched stock yet.
+  DRAFT
+  /// Signed off by the Stock Manager. Stock and exceptions follow from this.
+  CONFIRMED
+}
+
+/// One delivery into the warehouse. Shown as GRN-00012.
+model StockReceipt {
+  id          String                @id @default(uuid()) @db.Uuid
+  number      Int                   @unique @default(autoincrement())
+  source      ReceiptSource
+  /// Who sent it, as written on the paperwork (no supplier master in this release).
+  consignor   String
+  /// The bill, invoice or transfer-note number on the paperwork.
+  reference   String?
+  /// Scanned bill or delivery note in the private "stock-evidence" bucket.
+  billPath    String?               @map("bill_path")
+  locationId  String?               @map("location_id") @db.Uuid
+  status      WarehouseRecordStatus @default(DRAFT)
+  note        String?
+  receivedById String               @map("received_by_id") @db.Uuid
+  confirmedAt DateTime?             @map("confirmed_at")
+  createdAt   DateTime              @default(now()) @map("created_at")
+  updatedAt   DateTime              @updatedAt @map("updated_at")
+
+  receivedBy User                 @relation("ReceiptOfficer", fields: [receivedById], references: [id])
+  location   StockLocation?       @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  lines      StockReceiptLine[]
+  evidence   WarehouseEvidence[]
+
+  @@index([status, createdAt])
+  @@map("stock_receipts")
+}
+
+/// One product on a receipt: what the bill said, and what was actually counted off the truck.
+model StockReceiptLine {
+  id            String  @id @default(uuid()) @db.Uuid
+  receiptId     String  @map("receipt_id") @db.Uuid
+  variantId     String  @map("variant_id") @db.Uuid
+  /// Units the paperwork says were sent.
+  documentedQty Int     @map("documented_qty")
+  /// Units physically counted. The difference is the variance the Owner sees.
+  actualQty     Int     @map("actual_qty")
+  note          String?
+
+  receipt StockReceipt   @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([receiptId, variantId])
+  @@map("stock_receipt_lines")
+}
+
+/// What was actually picked from the warehouse for one customer order.
+model OrderCollection {
+  id         String                @id @default(uuid()) @db.Uuid
+  number     Int                   @unique @default(autoincrement())
+  orderId    String                @unique @map("order_id") @db.Uuid
+  /// Warehouse release bill number on the paperwork.
+  billRef    String?               @map("bill_ref")
+  billPath   String?               @map("bill_path")
+  status     WarehouseRecordStatus @default(DRAFT)
+  note       String?
+  officerId  String                @map("officer_id") @db.Uuid
+  confirmedAt DateTime?            @map("confirmed_at")
+  createdAt  DateTime              @default(now()) @map("created_at")
+  updatedAt  DateTime              @updatedAt @map("updated_at")
+
+  order    Order                 @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  officer  User                  @relation("CollectionOfficer", fields: [officerId], references: [id])
+  lines    OrderCollectionLine[]
+  evidence WarehouseEvidence[]
+
+  @@index([status, createdAt])
+  @@map("order_collections")
+}
+
+/// One order line as picked. pickedQty below the ordered quantity is a shortage.
+model OrderCollectionLine {
+  id           String  @id @default(uuid()) @db.Uuid
+  collectionId String  @map("collection_id") @db.Uuid
+  orderItemId  String  @map("order_item_id") @db.Uuid
+  orderedQty   Int     @map("ordered_qty")
+  pickedQty    Int     @map("picked_qty")
+  note         String?
+
+  collection OrderCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  orderItem  OrderItem       @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@unique([collectionId, orderItemId])
+  @@map("order_collection_lines")
+}
+
+/// How one order was boxed before it went to Quality Control.
+model OrderPacking {
+  id         String                @id @default(uuid()) @db.Uuid
+  orderId    String                @unique @map("order_id") @db.Uuid
+  /// Number of shipping master cartons.
+  cartons    Int                   @default(1)
+  /// Tamper-proof tape or seal identifier written on the cartons.
+  sealId     String?               @map("seal_id")
+  note       String?
+  status     WarehouseRecordStatus @default(DRAFT)
+  packedById String                @map("packed_by_id") @db.Uuid
+  confirmedAt DateTime?            @map("confirmed_at")
+  createdAt  DateTime              @default(now()) @map("created_at")
+  updatedAt  DateTime              @updatedAt @map("updated_at")
+
+  order    Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  packedBy User                @relation("PackingOfficer", fields: [packedById], references: [id])
+  evidence WarehouseEvidence[]
+
+  @@map("order_packings")
+}
+
+/// A photo or scanned bill attached to a receipt, a collection or a packing record.
+model WarehouseEvidence {
+  id           String   @id @default(uuid()) @db.Uuid
+  receiptId    String?  @map("receipt_id") @db.Uuid
+  collectionId String?  @map("collection_id") @db.Uuid
+  packingId    String?  @map("packing_id") @db.Uuid
+  /// File in the private "stock-evidence" bucket.
+  storagePath  String   @map("storage_path")
+  fileName     String   @map("file_name")
+  mimeType     String   @map("mime_type")
+  size         Int
+  caption      String?
+  uploadedById String   @map("uploaded_by_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  receipt    StockReceipt?    @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  collection OrderCollection? @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  packing    OrderPacking?    @relation(fields: [packingId], references: [id], onDelete: Cascade)
+  uploadedBy User             @relation("WarehouseEvidenceAuthor", fields: [uploadedById], references: [id])
+
+  @@index([receiptId])
+  @@index([collectionId])
+  @@index([packingId])
+  @@map("warehouse_evidence")
+}
+
+// ---------------- Content reviews (banners, Help Centre) ----------------
+
+/// Review state of one submitted version. A new version is created for every resubmission.
+enum ReviewStatus {
+  DRAFT
+  SUBMITTED
+  CHANGES_REQUESTED
+  APPROVED
+  REJECTED
+}
+
+enum PublicationStatus {
+  UNPUBLISHED
+  SCHEDULED
+  PUBLISHED
+  WITHDRAWN
+}
+
+/// Promotional banner. The Service Manager writes and submits versions; the Owner reviews and publishes.
+model Banner {
+  id                String            @id @default(uuid()) @db.Uuid
+  /// Shown as BN-00012.
+  number            Int               @unique @default(autoincrement())
+  createdById       String            @map("created_by_id") @db.Uuid
+  publication       PublicationStatus @default(UNPUBLISHED)
+  /// The approved version customers see once published.
+  liveVersionId     String?           @unique @map("live_version_id") @db.Uuid
+  publishAt         DateTime?         @map("publish_at")
+  publishedAt       DateTime?         @map("published_at")
+  publishedById     String?           @map("published_by_id") @db.Uuid
+  withdrawnAt       DateTime?         @map("withdrawn_at")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  createdBy   User           @relation("BannerCreator", fields: [createdById], references: [id])
+  publishedBy User?          @relation("BannerPublisher", fields: [publishedById], references: [id], onDelete: SetNull)
+  liveVersion BannerVersion? @relation("BannerLiveVersion", fields: [liveVersionId], references: [id], onDelete: SetNull)
+  versions    BannerVersion[] @relation("BannerVersions")
+
+  @@index([publication])
+  @@map("banners")
+}
+
+model BannerVersion {
+  id              String       @id @default(uuid()) @db.Uuid
+  bannerId        String       @map("banner_id") @db.Uuid
+  version         Int
+  heading         String
+  description     String?
+  /// Images in the public "site-banners" bucket.
+  imagePath       String?      @map("image_path")
+  mobileImagePath String?      @map("mobile_image_path")
+  /// Where the banner leads, a path on this website such as /brands/keune.
+  linkUrl         String       @map("link_url")
+  displayFrom     DateTime?    @map("display_from")
+  displayTo       DateTime?    @map("display_to")
+  reviewStatus    ReviewStatus @default(DRAFT) @map("review_status")
+  submittedById   String?      @map("submitted_by_id") @db.Uuid
+  submittedAt     DateTime?    @map("submitted_at")
+  reviewedById    String?      @map("reviewed_by_id") @db.Uuid
+  reviewedAt      DateTime?    @map("reviewed_at")
+  reviewNote      String?      @map("review_note")
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  banner      Banner  @relation("BannerVersions", fields: [bannerId], references: [id], onDelete: Cascade)
+  liveFor     Banner? @relation("BannerLiveVersion")
+  submittedBy User?   @relation("BannerVersionSubmitter", fields: [submittedById], references: [id], onDelete: SetNull)
+  reviewedBy  User?   @relation("BannerVersionReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@unique([bannerId, version])
+  @@index([reviewStatus, submittedAt])
+  @@map("banner_versions")
+}
+
+enum ContentLanguage {
+  EN
+  SI
+}
+
+/// Help Centre article. English and Sinhala versions are written, reviewed and published separately.
+model HelpArticle {
+  id          String     @id @default(uuid()) @db.Uuid
+  /// Shown as HC-00012.
+  number      Int        @unique @default(autoincrement())
+  slug        String     @unique
+  topic       HelpTopic?
+  createdById String     @map("created_by_id") @db.Uuid
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  createdBy User                 @relation("ArticleCreator", fields: [createdById], references: [id])
+  versions  HelpArticleVersion[]
+  live      HelpArticleLive[]
+
+  @@map("help_articles")
+}
+
+model HelpArticleVersion {
+  id            String          @id @default(uuid()) @db.Uuid
+  articleId     String          @map("article_id") @db.Uuid
+  language      ContentLanguage
+  version       Int
+  title         String
+  summary       String?
+  body          String          @db.Text
+  reviewStatus  ReviewStatus    @default(DRAFT) @map("review_status")
+  submittedById String?         @map("submitted_by_id") @db.Uuid
+  submittedAt   DateTime?       @map("submitted_at")
+  reviewedById  String?         @map("reviewed_by_id") @db.Uuid
+  reviewedAt    DateTime?       @map("reviewed_at")
+  reviewNote    String?         @map("review_note")
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  article     HelpArticle      @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  submittedBy User?            @relation("ArticleVersionSubmitter", fields: [submittedById], references: [id], onDelete: SetNull)
+  reviewedBy  User?            @relation("ArticleVersionReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  liveFor     HelpArticleLive?
+
+  @@unique([articleId, language, version])
+  @@index([reviewStatus, submittedAt])
+  @@map("help_article_versions")
+}
+
+/// The published version of an article in one language.
+model HelpArticleLive {
+  articleId     String          @map("article_id") @db.Uuid
+  language      ContentLanguage
+  versionId     String          @unique @map("version_id") @db.Uuid
+  publishedById String?         @map("published_by_id") @db.Uuid
+  publishedAt   DateTime        @default(now()) @map("published_at")
+
+  article     HelpArticle        @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  version     HelpArticleVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  publishedBy User?              @relation("ArticlePublisher", fields: [publishedById], references: [id], onDelete: SetNull)
+
+  @@id([articleId, language])
+  @@map("help_articles_live")
+}
+
+// ---------------- Business exceptions ----------------
+
+enum ExceptionArea {
+  STOCK
+  FINANCE
+  ORDERS
+  SERVICE
+}
+
+enum ExceptionSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ExceptionStatus {
+  OPEN
+  OWNER_DECISION_REQUIRED
+  INFO_REQUESTED
+  SENT_TO_DEPARTMENT
+  RESOLVED
+}
+
+/// An issue a department records for oversight (shortage, payment mismatch, delivery problem...).
+/// The responsible department investigates; the Owner decides only where a decision is needed.
+model BusinessException {
+  id                    String            @id @default(uuid()) @db.Uuid
+  /// Shown as EX-00012.
+  number                Int               @unique @default(autoincrement())
+  area                  ExceptionArea
+  /// Type code, see EXCEPTION_TYPES in packages/shared/src/owner.ts.
+  type                  String
+  severity              ExceptionSeverity @default(MEDIUM)
+  status                ExceptionStatus   @default(OPEN)
+  title                 String
+  details               String?
+  /// Department responsible for the follow-up work.
+  department            RoleCode
+  variantId             String?           @map("variant_id") @db.Uuid
+  orderId               String?           @map("order_id") @db.Uuid
+  expectedQty           Int?              @map("expected_qty")
+  actualQty             Int?              @map("actual_qty")
+  expectedAmount        Decimal?          @map("expected_amount") @db.Decimal(12, 2)
+  actualAmount          Decimal?          @map("actual_amount") @db.Decimal(12, 2)
+  /// Physical stock correction proposed by the Stock Manager (applied only if the Owner approves).
+  proposedPhysicalDelta Int?              @map("proposed_physical_delta")
+  evidencePaths         String[]          @default([]) @map("evidence_paths")
+  raisedById            String?           @map("raised_by_id") @db.Uuid
+  detectedAt            DateTime          @default(now()) @map("detected_at")
+  resolvedAt            DateTime?         @map("resolved_at")
+  resolution            String?
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  order     Order?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  raisedBy  User?           @relation("ExceptionRaiser", fields: [raisedById], references: [id], onDelete: SetNull)
+  actions   ExceptionAction[]
+  movements StockMovement[]
+
+  @@index([status, area])
+  @@index([detectedAt])
+  @@map("business_exceptions")
+}
+
+/// Timeline of an exception: who did what, and why.
+model ExceptionAction {
+  id          String    @id @default(uuid()) @db.Uuid
+  exceptionId String    @map("exception_id") @db.Uuid
+  actorId     String?   @map("actor_id") @db.Uuid
+  actorRoles  String[]  @default([]) @map("actor_roles")
+  /// RAISED, INFO_REQUESTED, SENT_TO_DEPARTMENT, DECISION, CORRECTION_APPROVED, CORRECTION_REJECTED, RESOLVED, NOTE
+  action      String
+  note        String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  exception BusinessException @relation(fields: [exceptionId], references: [id], onDelete: Cascade)
+  actor     User?             @relation("ExceptionActionActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([exceptionId, createdAt])
+  @@map("exception_actions")
+}
+
+// ---------------- Finance (owned by the Accountant; the Owner reviews) ----------------
+
+enum ClosingStatus {
+  DRAFT
+  SUBMITTED
+}
+
+/// Daily financial closing prepared by the Accountant. Totals are worked out by the server from the
+/// orders of that day and frozen when submitted. The Owner can review it but never edits it.
+model FinancialClosing {
+  id                String        @id @default(uuid()) @db.Uuid
+  businessDate      DateTime      @unique @map("business_date") @db.Date
+  status            ClosingStatus @default(DRAFT)
+  ordersPlaced      Int           @default(0) @map("orders_placed")
+  salesTotal        Decimal       @default(0) @map("sales_total") @db.Decimal(12, 2)
+  onlinePaidTotal   Decimal       @default(0) @map("online_paid_total") @db.Decimal(12, 2)
+  codCollectedTotal Decimal       @default(0) @map("cod_collected_total") @db.Decimal(12, 2)
+  unpaidCount       Int           @default(0) @map("unpaid_count")
+  unpaidTotal       Decimal       @default(0) @map("unpaid_total") @db.Decimal(12, 2)
+  refundsTotal      Decimal       @default(0) @map("refunds_total") @db.Decimal(12, 2)
+  /// Differences found by the Accountant when reconciling cash and bank settlements.
+  cashDifference    Decimal       @default(0) @map("cash_difference") @db.Decimal(12, 2)
+  bankDifference    Decimal       @default(0) @map("bank_difference") @db.Decimal(12, 2)
+  notes             String?
+  preparedById      String        @map("prepared_by_id") @db.Uuid
+  submittedAt       DateTime?     @map("submitted_at")
+  ownerReviewedById String?       @map("owner_reviewed_by_id") @db.Uuid
+  ownerReviewedAt   DateTime?     @map("owner_reviewed_at")
+  ownerReviewNote   String?       @map("owner_review_note")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  preparedBy      User  @relation("ClosingPreparer", fields: [preparedById], references: [id])
+  ownerReviewedBy User? @relation("ClosingReviewer", fields: [ownerReviewedById], references: [id], onDelete: SetNull)
+
+  @@map("financial_closings")
+}
+
+// ---------------- Staff and team goals ----------------
+
+enum GoalScope {
+  INDIVIDUAL
+  TEAM
+}
+
+/// OVERDUE is not stored: an ACTIVE goal past its deadline is shown as overdue.
+enum GoalStatus {
+  ACTIVE
+  COMPLETED
+  NOT_COMPLETED
+  WITHDRAWN
+}
+
+model Goal {
+  id           String     @id @default(uuid()) @db.Uuid
+  /// Shown as GL-00012.
+  number       Int        @unique @default(autoincrement())
+  name         String
+  description  String?
+  scope        GoalScope
+  /// Individual goals: the staff member. Team goals: null.
+  assigneeId   String?    @map("assignee_id") @db.Uuid
+  /// The role whose dashboard shows the goal (and, for team goals, whose members count).
+  role         RoleCode
+  /// Recorded activity that is counted, see GOAL_METRICS in packages/shared/src/owner.ts.
+  metric       String
+  target       Int
+  startDate    DateTime   @map("start_date")
+  deadline     DateTime
+  reviewPeriod String?    @map("review_period")
+  instructions String?
+  status       GoalStatus @default(ACTIVE)
+  /// Progress frozen when the Owner closes the goal.
+  resultValue  Int?       @map("result_value")
+  closedAt     DateTime?  @map("closed_at")
+  feedback     String?
+  createdById  String     @map("created_by_id") @db.Uuid
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  assignee  User?          @relation("GoalAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  createdBy User           @relation("GoalCreator", fields: [createdById], references: [id])
+  revisions GoalRevision[]
+
+  @@index([status, deadline])
+  @@index([assigneeId])
+  @@index([role])
+  @@map("goals")
+}
+
+/// Every change to an active goal: original and new values, who and why.
+model GoalRevision {
+  id          String   @id @default(uuid()) @db.Uuid
+  goalId      String   @map("goal_id") @db.Uuid
+  changedById String   @map("changed_by_id") @db.Uuid
+  reason      String
+  oldValues   Json     @map("old_values")
+  newValues   Json     @map("new_values")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  goal      Goal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  changedBy User @relation("GoalRevisionAuthor", fields: [changedById], references: [id])
+
+  @@index([goalId, createdAt])
+  @@map("goal_revisions")
+}
+
+/* ============================================================
+ * Deliverer performance: demerit rules and violations
+ * Rules are owner-configured. A violation keeps the points of the rule version it was recorded
+ * under, so later rule changes never alter past records. Points count only once CONFIRMED.
+ * ============================================================ */
+
+enum ViolationStatus {
+  /// Recorded, waiting for the Owner's decision. Carries no points yet.
+  PROPOSED
+  /// The Owner confirmed it with a written justification. Points count.
+  CONFIRMED
+  /// The Owner dismissed it. No points.
+  DISMISSED
+  /// The deliverer appealed a confirmed violation. Points still count until the appeal is decided.
+  APPEALED
+  /// Appeal accepted: points removed (the history stays).
+  APPEAL_UPHELD
+  /// Appeal rejected: points stay.
+  APPEAL_REJECTED
+}
+
+/// One rule version. Changing a rule closes the current version and creates a new one.
+model DemeritRule {
+  id          String    @id @default(uuid()) @db.Uuid
+  /// Stable code shared by all versions of a rule, e.g. "LATE_DELIVERY".
+  code        String
+  version     Int
+  name        String
+  description String?
+  points      Int
+  active      Boolean   @default(true)
+  changedById String    @map("changed_by_id") @db.Uuid
+  reason      String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  /// Set when a newer version replaces this one (or the rule is retired).
+  retiredAt   DateTime? @map("retired_at")
+
+  changedBy  User                 @relation("DemeritRuleAuthor", fields: [changedById], references: [id])
+  violations DelivererViolation[]
+
+  @@unique([code, version])
+  @@index([code, retiredAt])
+  @@map("demerit_rules")
+}
+
+model DelivererViolation {
+  id           String          @id @default(uuid()) @db.Uuid
+  /// Running number shown as VIO-00012.
+  number       Int             @unique @default(autoincrement())
+  delivererId  String          @map("deliverer_id") @db.Uuid
+  orderId      String?         @map("order_id") @db.Uuid
+  ruleId       String          @map("rule_id") @db.Uuid
+  /// Copied from the rule version when recorded (never recalculated).
+  points       Int
+  status       ViolationStatus @default(PROPOSED)
+  details      String
+  /// Where the report came from, e.g. "Customer inspection", "Cash audit".
+  source       String
+  reportedById String          @map("reported_by_id") @db.Uuid
+  decidedById  String?         @map("decided_by_id") @db.Uuid
+  decisionNote String?         @map("decision_note")
+  decidedAt    DateTime?       @map("decided_at")
+  appealNote   String?         @map("appeal_note")
+  appealedAt   DateTime?       @map("appealed_at")
+  occurredAt   DateTime        @map("occurred_at")
+  createdAt    DateTime        @default(now()) @map("created_at")
+
+  deliverer  User              @relation("ViolationDeliverer", fields: [delivererId], references: [id])
+  order      Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  rule       DemeritRule       @relation(fields: [ruleId], references: [id])
+  reportedBy User              @relation("ViolationReporter", fields: [reportedById], references: [id])
+  decidedBy  User?             @relation("ViolationDecider", fields: [decidedById], references: [id])
+  actions    ViolationAction[]
+
+  @@index([delivererId, status])
+  @@index([status, createdAt])
+  @@map("deliverer_violations")
+}
+
+/// Timeline of a violation (recorded, confirmed, appealed...). Never edited or deleted.
+model ViolationAction {
+  id          String          @id @default(uuid()) @db.Uuid
+  violationId String          @map("violation_id") @db.Uuid
+  status      ViolationStatus
+  note        String?
+  actorId     String          @map("actor_id") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  violation DelivererViolation @relation(fields: [violationId], references: [id], onDelete: Cascade)
+  actor     User               @relation("ViolationActionActor", fields: [actorId], references: [id])
+
+  @@index([violationId, createdAt])
+  @@map("violation_actions")
+}
+
+/// Integrity checkpoint (Owner, System Health): counts and SHA-256 digests of key business data at a
+/// moment in time, so later changes can be detected. It is not a backup and nothing is ever restored from it.
+model IntegrityCheckpoint {
+  id          String   @id @default(uuid()) @db.Uuid
+  number      Int      @unique @default(autoincrement())
+  digest      String
+  /// [{ key, rows, digest }] per data set.
+  datasets    Json
+  /// One product's wholesale rules at the time (pack, prices, MOQ, order step).
+  sample      Json?
+  note        String?
+  createdById String?  @map("created_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  createdBy User? @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@map("integrity_checkpoints")
+}
+
+/// Operating expense categories (business overheads, not stock purchases).
+enum ExpenseCategory {
+  SALARIES
+  RENT
+  DELIVERY_FUEL
+  PACKAGING
+  MARKETING
+  UTILITIES
+  MAINTENANCE
+  PROFESSIONAL_FEES
+  OTHER
+}
+
+/// DRAFT = not counted yet; ACCRUED = owed, not paid; PAID = paid out; VOID = cancelled with a reason (kept for audit).
+enum ExpenseStatus {
+  DRAFT
+  ACCRUED
+  PAID
+  VOID
+}
+
+/// An operating expense voucher (EXP-2026-00012). Never deleted: voided with a reason instead.
+model Expense {
+  id          String          @id @default(uuid()) @db.Uuid
+  number      Int             @unique @default(autoincrement())
+  description String
+  payee       String?
+  category    ExpenseCategory
+  amount      Decimal         @db.Decimal(12, 2)
+  expenseDate DateTime        @map("expense_date") @db.Date
+  status      ExpenseStatus   @default(DRAFT)
+  /// Reference of the outgoing payment (cheque, transfer or receipt number). Informational only.
+  paymentRef  String?         @map("payment_ref")
+  paidAt      DateTime?       @map("paid_at")
+  /// Private file in the expense-receipts bucket.
+  receiptPath String?         @map("receipt_path")
+  notes       String?
+  voidReason  String?         @map("void_reason")
+  createdById String          @map("created_by_id") @db.Uuid
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  createdBy User @relation("ExpenseCreator", fields: [createdById], references: [id])
+
+  @@index([expenseDate])
+  @@index([status, category])
+  @@map("expenses")
+}
+
+/// Monthly spending cap per expense category, set by the Owner. No row = no cap ("Not configured").
+model ExpenseBudget {
+  id          String          @id @default(uuid()) @db.Uuid
+  /// YYYY-MM (Sri Lanka calendar month).
+  month       String
+  category    ExpenseCategory
+  cap         Decimal         @db.Decimal(12, 2)
+  updatedById String          @map("updated_by_id") @db.Uuid
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  @@unique([month, category])
+  @@map("expense_budgets")
+}
+
+/// A company-level goal whose progress is measured from live records (see BUSINESS_METRICS).
+model BusinessGoal {
+  id          String     @id @default(uuid()) @db.Uuid
+  number      Int        @unique @default(autoincrement())
+  name        String
+  metric      String
+  target      Decimal    @db.Decimal(14, 2)
+  startDate   DateTime   @map("start_date") @db.Date
+  deadline    DateTime   @db.Date
+  status      GoalStatus @default(ACTIVE)
+  /// Progress frozen when the goal is closed.
+  resultValue Decimal?   @map("result_value") @db.Decimal(14, 2)
+  notes       String?
+  closedAt    DateTime?  @map("closed_at")
+  createdById String     @map("created_by_id") @db.Uuid
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  createdBy User @relation(fields: [createdById], references: [id])
+
+  @@index([status, deadline])
+  @@map("business_goals")
+}
